@@ -10,6 +10,7 @@ import {
   type Member,
   type PointLedgerEntry,
   type Program,
+  type ProgramPolicyVersion,
   type RequestContext,
   type RewardDefinition,
   type RewardKind,
@@ -80,6 +81,27 @@ interface EventIngestInput extends RequestContext {
   payload: Record<string, unknown>;
 }
 
+interface PolicyVersionCreateInput {
+  name: string;
+  description?: string;
+  version_label?: string;
+  change_reason: string;
+  effective_at?: string;
+  policy: ProgramPolicyVersion["policy"];
+  metadata: Record<string, unknown>;
+}
+
+interface PolicyPublishInput {
+  change_reason?: string;
+  effective_at?: string;
+}
+
+interface PolicySimulationInput extends RequestContext {
+  member_key?: string;
+  cart: Cart;
+  metadata: Record<string, unknown>;
+}
+
 function assertProgram(programId: string): Program {
   const program = useLoyaltyStore().getProgram(programId);
   if (!program || !program.active) {
@@ -113,6 +135,15 @@ function memberOrBusinessError(programId: string, memberKey: string): Member {
 
   assertActiveMember(member);
   return member;
+}
+
+function assertPolicyVersion(programId: string, policyVersionId: string): ProgramPolicyVersion {
+  const policyVersion = useLoyaltyStore().getPolicyVersion(policyVersionId);
+  if (!policyVersion || policyVersion.program_id !== programId) {
+    throw notFound("Policy version was not found");
+  }
+
+  return policyVersion;
 }
 
 function responseMember(member: Member): Record<string, unknown> {
@@ -213,6 +244,42 @@ function responseRewardUsageFact(fact: LoyaltyRewardUsageFact): Record<string, u
   };
 }
 
+function responsePolicyVersion(policyVersion: ProgramPolicyVersion): Record<string, unknown> {
+  return {
+    id: policyVersion.id,
+    program_id: policyVersion.program_id,
+    version: policyVersion.version,
+    version_label: policyVersion.version_label,
+    status: policyVersion.status,
+    name: policyVersion.name,
+    description: policyVersion.description,
+    policy: policyVersion.policy,
+    change_reason: policyVersion.change_reason,
+    created_by: policyVersion.created_by,
+    effective_at: policyVersion.effective_at,
+    published_at: policyVersion.published_at,
+    retired_at: policyVersion.retired_at,
+    metadata: policyVersion.metadata,
+    created_at: policyVersion.created_at,
+    updated_at: policyVersion.updated_at
+  };
+}
+
+function responsePolicyVersionSummary(policyVersion?: ProgramPolicyVersion): Record<string, unknown> | undefined {
+  if (!policyVersion) {
+    return undefined;
+  }
+
+  return {
+    id: policyVersion.id,
+    version: policyVersion.version,
+    version_label: policyVersion.version_label,
+    status: policyVersion.status,
+    name: policyVersion.name,
+    effective_at: policyVersion.effective_at
+  };
+}
+
 function availableRewards(programId: string, member: Member, context: RequestContext): RewardDefinition[] {
   return useLoyaltyStore()
     .listRewards(programId)
@@ -260,6 +327,73 @@ function applyLedgerToMember(member: Member, ledgerEntry: PointLedgerEntry): Mem
   });
 }
 
+function activePolicyVersion(programId: string): ProgramPolicyVersion | undefined {
+  return useLoyaltyStore().getActivePolicyVersion(programId);
+}
+
+function earnableMinorForPolicy(cart: Cart, basis: ProgramPolicyVersion["policy"]["earning"]["eligible_amount_basis"]): number {
+  if (basis === "net_after_discount_including_tax") {
+    return Math.max(0, cart.grand_total);
+  }
+
+  if (basis === "subtotal_before_discount") {
+    return Math.max(0, cart.subtotal);
+  }
+
+  return Math.max(0, cart.subtotal - cart.discount_total);
+}
+
+function roundPoints(value: number, mode: ProgramPolicyVersion["policy"]["earning"]["rounding"]): number {
+  if (mode === "ceil") {
+    return Math.ceil(value);
+  }
+
+  if (mode === "nearest") {
+    return Math.round(value);
+  }
+
+  return Math.floor(value);
+}
+
+function buildEarnPreview(
+  program: Program,
+  input: EarnPreviewInput,
+  policyVersion = activePolicyVersion(program.id)
+): Record<string, unknown> {
+  const earning = policyVersion?.policy.earning ?? {
+    eligible_amount_basis: "net_after_discount_excluding_tax" as const,
+    points_per_currency_unit: program.earn_rate.points_per_currency_unit,
+    currency_unit_minor: program.earn_rate.currency_unit_minor,
+    rounding: "floor" as const,
+    earn_on_discounted_items: true,
+    excluded_line_tags: []
+  };
+  const currency = input.currency ?? program.default_currency;
+  const earnableMinor = earnableMinorForPolicy(input.cart, earning.eligible_amount_basis);
+  const rawPoints = (earnableMinor / earning.currency_unit_minor) * earning.points_per_currency_unit;
+  const points = roundPoints(rawPoints, earning.rounding);
+
+  return {
+    member_key: input.member_key,
+    channel: input.channel,
+    currency,
+    cart_total_minor: input.cart.grand_total,
+    earnable_minor: earnableMinor,
+    points,
+    points_name: program.points_name,
+    policy: {
+      kind: policyVersion ? "versioned_policy" : "program_earn_rate",
+      policy_version: responsePolicyVersionSummary(policyVersion),
+      eligible_amount_basis: earning.eligible_amount_basis,
+      points_per_currency_unit: earning.points_per_currency_unit,
+      currency_unit_minor: earning.currency_unit_minor,
+      rounding: earning.rounding,
+      earn_on_discounted_items: earning.earn_on_discounted_items,
+      excluded_line_tags: earning.excluded_line_tags
+    }
+  };
+}
+
 function emitInternalEvent(
   programId: string,
   eventType: EventType,
@@ -289,6 +423,7 @@ function emitInternalEvent(
 export function getConfiguration(programId: string, context: RequestContext): Record<string, unknown> {
   const program = assertProgram(programId);
   assertChannel(program, context.channel);
+  const policyVersion = activePolicyVersion(programId);
 
   return {
     program: {
@@ -302,6 +437,8 @@ export function getConfiguration(programId: string, context: RequestContext): Re
     },
     context,
     earn_rate: program.earn_rate,
+    active_policy_version: responsePolicyVersionSummary(policyVersion),
+    policy: policyVersion?.policy,
     rewards: useLoyaltyStore()
       .listRewards(programId)
       .filter((reward) => rewardIsContextual(reward, context))
@@ -436,25 +573,7 @@ export function previewEarn(programId: string, input: EarnPreviewInput): Record<
     throw businessRule("cart_does_not_qualify", `Program ${programId} currently earns only in ${program.default_currency}`);
   }
 
-  const earnableMinor = Math.max(0, input.cart.subtotal - input.cart.discount_total);
-  const points = Math.floor(
-    (earnableMinor / program.earn_rate.currency_unit_minor) * program.earn_rate.points_per_currency_unit
-  );
-
-  return {
-    member_key: input.member_key,
-    channel: input.channel,
-    currency,
-    cart_total_minor: input.cart.grand_total,
-    earnable_minor: earnableMinor,
-    points,
-    points_name: program.points_name,
-    policy: {
-      kind: "simple_subtotal_rate",
-      points_per_currency_unit: program.earn_rate.points_per_currency_unit,
-      currency_unit_minor: program.earn_rate.currency_unit_minor
-    }
-  };
+  return buildEarnPreview(program, input);
 }
 
 export function commitEarn(programId: string, input: EarnCommitInput): Record<string, unknown> {
@@ -472,7 +591,7 @@ export function commitEarn(programId: string, input: EarnCommitInput): Record<st
     });
   }
 
-  const preview = previewEarn(programId, input) as { points: number };
+  const preview = previewEarn(programId, input) as { points: number; policy?: Record<string, unknown> };
   const currency = input.currency ?? program.default_currency;
   const ledgerEntry = useLoyaltyStore().appendLedgerEntry({
     program_id: programId,
@@ -487,6 +606,7 @@ export function commitEarn(programId: string, input: EarnCommitInput): Record<st
       channel: input.channel,
       cart: input.cart,
       context: contextForMetadata(input),
+      policy: preview.policy,
       input_metadata: input.metadata
     }
   });
@@ -940,6 +1060,89 @@ export function updateProgram(programId: string, input: Partial<Omit<Program, "i
     ...input,
     id: programId
   });
+}
+
+export function listPolicyVersions(programId: string): Record<string, unknown> {
+  assertProgram(programId);
+  const active = activePolicyVersion(programId);
+  return {
+    active_policy_version: responsePolicyVersionSummary(active),
+    policy_versions: useLoyaltyStore().listPolicyVersions(programId).map((policyVersion) => responsePolicyVersion(policyVersion))
+  };
+}
+
+export function getPolicyVersion(programId: string, policyVersionId: string): Record<string, unknown> {
+  return {
+    policy_version: responsePolicyVersion(assertPolicyVersion(programId, policyVersionId))
+  };
+}
+
+export function createPolicyVersion(programId: string, input: PolicyVersionCreateInput): Record<string, unknown> {
+  assertProgram(programId);
+  const policyVersion = useLoyaltyStore().addPolicyVersion({
+    program_id: programId,
+    name: input.name,
+    description: input.description,
+    version_label: input.version_label,
+    policy: input.policy,
+    change_reason: input.change_reason,
+    effective_at: input.effective_at,
+    metadata: input.metadata
+  });
+
+  return {
+    policy_version: responsePolicyVersion(policyVersion)
+  };
+}
+
+export function simulatePolicyVersion(
+  programId: string,
+  policyVersionId: string,
+  input: PolicySimulationInput
+): Record<string, unknown> {
+  const program = assertProgram(programId);
+  assertChannel(program, input.channel);
+  const policyVersion = assertPolicyVersion(programId, policyVersionId);
+  const earnPreview = buildEarnPreview(
+    program,
+    {
+      ...input,
+      member_key: input.member_key ?? "simulation:anonymous"
+    },
+    policyVersion
+  );
+
+  return {
+    policy_version: responsePolicyVersionSummary(policyVersion),
+    simulation: {
+      earn_preview: earnPreview
+    }
+  };
+}
+
+export function publishPolicyVersion(
+  programId: string,
+  policyVersionId: string,
+  input: PolicyPublishInput = {}
+): Record<string, unknown> {
+  const program = assertProgram(programId);
+  assertPolicyVersion(programId, policyVersionId);
+  const policyVersion = useLoyaltyStore().publishPolicyVersion(policyVersionId, input);
+  if (!policyVersion) {
+    throw notFound("Policy version was not found");
+  }
+
+  useLoyaltyStore().upsertProgram({
+    ...program,
+    earn_rate: {
+      points_per_currency_unit: policyVersion.policy.earning.points_per_currency_unit,
+      currency_unit_minor: policyVersion.policy.earning.currency_unit_minor
+    }
+  });
+
+  return {
+    active_policy_version: responsePolicyVersion(policyVersion)
+  };
 }
 
 export function listAdminMembers(programId?: string): Member[] {

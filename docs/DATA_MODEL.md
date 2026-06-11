@@ -10,6 +10,7 @@ loyalty_programs
 loyalty_sites
 loyalty_channels
 loyalty_api_keys
+loyalty_program_policy_versions
 
 loyalty_members
 loyalty_member_identities
@@ -60,6 +61,40 @@ loyalty_execution_logs
 - Idempotency keys are unique per program and prevent double-awards.
 
 The migration creates `prevent_loyalty_ledger_mutation()` and triggers that reject update/delete operations on `loyalty_point_ledger_entries`.
+
+## Program, Policy, Rule, Version
+
+A `program` is the merchant-facing container for one loyalty experience. It owns channels, countries, language support, point naming, default currency, members, tiers, rewards, and active policy.
+
+A `policy` is the business configuration that decides how the program behaves. It should hold earning basis, redemption value, tier qualification, campaign stacking, expiry, referral, and consent requirements. Policy is configuration, not source transaction data.
+
+A `rule` is an individual conditional statement inside a policy or admin-managed rule list. Examples:
+
+```text
+earn 1 point per SGD 1 on net paid amount
+minimum redemption is 300 points
+Gold tier starts at 5,000 lifetime points
+birthday campaign does not stack with another promotional campaign
+referrer receives 200 points after first completed non-refunded purchase
+```
+
+A `policy version` is an immutable publishable snapshot of policy. Operators draft a new version, simulate it, then publish it. Publishing retires the previous active policy version and makes the new version the policy used by preview, commit, POS, CRM, and agent explanations.
+
+`loyalty_program_policy_versions` stores:
+
+```text
+program_id
+version
+version_label
+status = draft | active | retired
+policy
+change_reason
+effective_at
+published_at
+retired_at
+```
+
+The policy JSON should remain business-agnostic. It can represent LISE-style skincare decisions, food-and-beverage stamps, marketplace rewards, or referral-led services without changing the core ledger.
 
 ## Identity
 

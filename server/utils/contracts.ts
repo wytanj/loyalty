@@ -2,6 +2,17 @@ import { z } from "zod";
 
 export const channels = ["web", "pos", "mobile", "marketplace", "social", "agent", "partner"] as const;
 export const sourceSystems = ["pos", "skums", "crm", "loyalty", "shopify", "custom"] as const;
+export const policyVersionStatuses = ["draft", "active", "retired"] as const;
+export const policyRuleDomains = ["earning", "redemption", "tier", "campaign", "expiry", "referral", "consent", "eligibility"] as const;
+export const earningAmountBases = [
+  "net_after_discount_excluding_tax",
+  "net_after_discount_including_tax",
+  "subtotal_before_discount"
+] as const;
+export const policyRoundingModes = ["floor", "ceil", "nearest"] as const;
+export const campaignStackModes = ["base_plus_best_promo", "exclusive", "stack_all"] as const;
+export const pointExpiryModes = ["none", "fixed_from_earn", "after_inactivity"] as const;
+export const referralTriggerEvents = ["signup", "first_completed_purchase", "manual_approval"] as const;
 export const rewardKinds = [
   "cart_discount",
   "free_shipping",
@@ -102,6 +113,7 @@ export type EventType = (typeof eventTypes)[number];
 export type ApiScope = (typeof apiScopes)[number];
 export type ApiErrorCode = (typeof apiErrorCodes)[number];
 export type SourceSystem = (typeof sourceSystems)[number];
+export type PolicyVersionStatus = (typeof policyVersionStatuses)[number];
 
 export const channelSchema = z.enum(channels);
 export const rewardKindSchema = z.enum(rewardKinds);
@@ -109,6 +121,7 @@ export const ruleKindSchema = z.enum(ruleKinds);
 export const eventTypeSchema = z.enum(eventTypes);
 export const apiScopeSchema = z.enum(apiScopes);
 export const sourceSystemSchema = z.enum(sourceSystems);
+export const policyVersionStatusSchema = z.enum(policyVersionStatuses);
 
 const optionalTrimmed = z.string().trim().min(1).optional();
 const countrySchema = z
@@ -289,6 +302,109 @@ export const programInputSchema = z.object({
   active: z.boolean().default(true)
 });
 
+export const policyRuleSchema = z.object({
+  key: z.string().trim().min(2).max(120).regex(/^[a-z0-9_.-]+$/i),
+  name: z.string().trim().min(1).max(160),
+  description: optionalTrimmed,
+  domain: z.enum(policyRuleDomains),
+  priority: z.number().int().min(0).max(1_000_000).default(100),
+  stack_key: optionalTrimmed,
+  exclusive: z.boolean().default(false),
+  conditions: z.record(z.unknown()).default({}),
+  effects: z.record(z.unknown()).default({}),
+  active: z.boolean().default(true)
+});
+
+export const programPolicyDefinitionSchema = z.object({
+  earning: z
+    .object({
+      eligible_amount_basis: z.enum(earningAmountBases).default("net_after_discount_excluding_tax"),
+      points_per_currency_unit: z.number().int().min(0).max(10_000).default(1),
+      currency_unit_minor: z.number().int().positive().default(100),
+      rounding: z.enum(policyRoundingModes).default("floor"),
+      earn_on_discounted_items: z.boolean().default(true),
+      excluded_line_tags: z.array(z.string().trim().min(1).max(80)).default([])
+    })
+    .default({}),
+  redemption: z
+    .object({
+      points_per_currency_unit: z.number().int().positive().default(100),
+      currency_unit_minor: z.number().int().positive().default(100),
+      minimum_points: z.number().int().min(0).default(0),
+      maximum_discount_minor: z.number().int().min(0).optional(),
+      allow_partial_redemption: z.boolean().default(true)
+    })
+    .default({}),
+  tiers: z
+    .object({
+      qualification_metric: z.enum(["lifetime_points", "rolling_spend_minor", "rolling_points"]).default("lifetime_points"),
+      rolling_window_days: z.number().int().positive().optional(),
+      thresholds: z
+        .array(
+          z.object({
+            name: z.string().trim().min(1).max(120),
+            threshold: z.number().int().min(0),
+            benefits: z.record(z.unknown()).default({})
+          })
+        )
+        .default([])
+    })
+    .default({}),
+  campaigns: z
+    .object({
+      default_stack_mode: z.enum(campaignStackModes).default("base_plus_best_promo"),
+      max_promotional_rules_per_transaction: z.number().int().min(0).max(100).default(1),
+      exclusivity_groups: z.array(z.string().trim().min(1).max(120)).default([])
+    })
+    .default({}),
+  expiry: z
+    .object({
+      mode: z.enum(pointExpiryModes).default("none"),
+      days: z.number().int().positive().optional(),
+      notice_days: z.number().int().min(0).default(30)
+    })
+    .default({}),
+  referral: z
+    .object({
+      enabled: z.boolean().default(false),
+      trigger_event: z.enum(referralTriggerEvents).default("first_completed_purchase"),
+      referrer_reward: z.record(z.unknown()).default({}),
+      referee_reward: z.record(z.unknown()).default({}),
+      cooldown_days: z.number().int().min(0).default(0),
+      max_rewards_per_member_per_period: z.number().int().positive().optional()
+    })
+    .default({}),
+  consent: z
+    .object({
+      privacy_policy_version: optionalTrimmed,
+      required_purposes: z.array(z.string().trim().min(1).max(120)).default([])
+    })
+    .default({}),
+  rules: z.array(policyRuleSchema).default([]),
+  metadata: z.record(z.unknown()).default({})
+});
+
+export const adminPolicyVersionInputSchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  description: optionalTrimmed,
+  version_label: optionalTrimmed,
+  change_reason: z.string().trim().min(3).max(1_000),
+  effective_at: z.string().datetime().optional(),
+  policy: programPolicyDefinitionSchema.default({}),
+  metadata: z.record(z.unknown()).default({})
+});
+
+export const policyPublishInputSchema = z.object({
+  change_reason: z.string().trim().min(3).max(1_000).optional(),
+  effective_at: z.string().datetime().optional()
+}).default({});
+
+export const policySimulationInputSchema = requestContextSchema.extend({
+  member_key: memberKeySchema.optional(),
+  cart: cartSchema,
+  metadata: z.record(z.unknown()).default({})
+});
+
 export const adminRewardInputSchema = z.object({
   program_id: z.string().trim().min(1),
   kind: rewardKindSchema,
@@ -347,6 +463,8 @@ export const webhookSubscriptionInputSchema = z.object({
 export type RequestContext = z.infer<typeof requestContextSchema>;
 export type CartLineItem = z.infer<typeof cartLineItemSchema>;
 export type Cart = z.infer<typeof cartSchema>;
+export type PolicyRule = z.infer<typeof policyRuleSchema>;
+export type ProgramPolicyDefinition = z.infer<typeof programPolicyDefinitionSchema>;
 
 export interface Program {
   id: string;
@@ -362,6 +480,25 @@ export interface Program {
     currency_unit_minor: number;
   };
   active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProgramPolicyVersion {
+  id: string;
+  program_id: string;
+  version: number;
+  version_label?: string;
+  status: PolicyVersionStatus;
+  name: string;
+  description?: string;
+  policy: ProgramPolicyDefinition;
+  change_reason: string;
+  created_by?: string;
+  effective_at?: string;
+  published_at?: string;
+  retired_at?: string;
+  metadata: Record<string, unknown>;
   created_at: string;
   updated_at: string;
 }

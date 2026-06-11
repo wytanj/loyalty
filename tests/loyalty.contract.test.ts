@@ -1,20 +1,25 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { requestContextSchema, eventIngestRequestSchema, type Cart } from "@server/utils/contracts";
+import { adminPolicyVersionInputSchema, requestContextSchema, eventIngestRequestSchema, type Cart } from "@server/utils/contracts";
 import { LoyaltyError } from "@server/utils/errors";
 import {
   adminAdjustPoints,
   commitEarn,
   completeRule,
+  createPolicyVersion,
+  getConfiguration,
   getAdminLedger,
   getAdminRewardUsage,
   getCommerceSummary,
   getMember,
   ingestEvent,
   initializeSession,
+  listPolicyVersions,
   previewEarn,
+  publishPolicyVersion,
   refundReward,
   redeemReward,
-  reverseEarn
+  reverseEarn,
+  simulatePolicyVersion
 } from "@server/utils/services";
 import { resetLoyaltyStoreForTests, useLoyaltyStore } from "@server/utils/store";
 
@@ -323,5 +328,112 @@ describe("headless loyalty contracts", () => {
       status: "issued",
       external_sale_id: "txn_admin_read_1"
     });
+  });
+
+  it("drafts, simulates, and publishes versioned policy changes", () => {
+    const policyInput = adminPolicyVersionInputSchema.parse({
+      name: "Launch earn policy refresh",
+      version_label: "2026-06-v2",
+      change_reason: "Double base earn and define commercial guardrails",
+      policy: {
+        earning: {
+          eligible_amount_basis: "net_after_discount_excluding_tax",
+          points_per_currency_unit: 2,
+          currency_unit_minor: 100,
+          rounding: "floor",
+          earn_on_discounted_items: true
+        },
+        redemption: {
+          points_per_currency_unit: 100,
+          currency_unit_minor: 100,
+          minimum_points: 300
+        },
+        tiers: {
+          qualification_metric: "lifetime_points",
+          thresholds: [
+            { name: "Bronze", threshold: 0 },
+            { name: "Silver", threshold: 1_000 },
+            { name: "Gold", threshold: 5_000 }
+          ]
+        },
+        campaigns: {
+          default_stack_mode: "base_plus_best_promo",
+          max_promotional_rules_per_transaction: 1
+        },
+        expiry: {
+          mode: "after_inactivity",
+          days: 365,
+          notice_days: 30
+        },
+        referral: {
+          enabled: true,
+          trigger_event: "first_completed_purchase",
+          referrer_reward: { points: 200 },
+          referee_reward: { cart_discount_minor: 500 }
+        },
+        consent: {
+          privacy_policy_version: "2026-06-privacy-v1",
+          required_purposes: ["loyalty_operations", "marketing"]
+        },
+        rules: [
+          {
+            key: "birthday.non_stack",
+            name: "Birthday offer does not stack with another promotional campaign",
+            domain: "campaign",
+            priority: 10,
+            exclusive: true,
+            conditions: { campaign_key: "birthday" },
+            effects: { stack_group: "seasonal_bonus" }
+          }
+        ]
+      }
+    });
+    const draft = createPolicyVersion("demo", policyInput) as {
+      policy_version: { id: string; status: string; policy: { redemption: { minimum_points: number } } };
+    };
+
+    expect(draft.policy_version.status).toBe("draft");
+    expect(draft.policy_version.policy.redemption.minimum_points).toBe(300);
+
+    const simulation = simulatePolicyVersion("demo", draft.policy_version.id, {
+      member_key: "crm:person_123",
+      channel: "pos",
+      currency: "SGD",
+      cart,
+      metadata: {}
+    }) as { simulation: { earn_preview: { points: number; policy: { policy_version: { id: string } } } } };
+    expect(simulation.simulation.earn_preview.points).toBe(236);
+    expect(simulation.simulation.earn_preview.policy.policy_version.id).toBe(draft.policy_version.id);
+
+    const published = publishPolicyVersion("demo", draft.policy_version.id, {
+      change_reason: "Approved for launch"
+    }) as { active_policy_version: { id: string; status: string } };
+    expect(published.active_policy_version).toMatchObject({
+      id: draft.policy_version.id,
+      status: "active"
+    });
+
+    const preview = previewEarn("demo", {
+      member_key: "crm:person_123",
+      channel: "pos",
+      currency: "SGD",
+      cart,
+      metadata: {}
+    }) as { points: number; policy: { kind: string; policy_version: { id: string } } };
+    expect(preview.points).toBe(236);
+    expect(preview.policy).toMatchObject({
+      kind: "versioned_policy",
+      policy_version: { id: draft.policy_version.id }
+    });
+
+    const configuration = getConfiguration("demo", { channel: "pos", currency: "SGD" }) as {
+      active_policy_version: { id: string };
+      policy: { consent: { privacy_policy_version?: string } };
+    };
+    expect(configuration.active_policy_version.id).toBe(draft.policy_version.id);
+    expect(configuration.policy.consent.privacy_policy_version).toBe("2026-06-privacy-v1");
+
+    const versions = listPolicyVersions("demo") as { policy_versions: Array<{ status: string }> };
+    expect(versions.policy_versions.map((policyVersion) => policyVersion.status)).toContain("retired");
   });
 });

@@ -211,6 +211,12 @@ POST /api/v1/admin/programs
 GET  /api/v1/admin/programs/{program_id}
 PUT  /api/v1/admin/programs/{program_id}
 
+GET  /api/v1/admin/programs/{program_id}/policy-versions
+POST /api/v1/admin/programs/{program_id}/policy-versions
+GET  /api/v1/admin/programs/{program_id}/policy-versions/{policy_version_id}
+POST /api/v1/admin/programs/{program_id}/policy-versions/{policy_version_id}/simulate
+POST /api/v1/admin/programs/{program_id}/policy-versions/{policy_version_id}/publish
+
 GET  /api/v1/admin/rules?program_id={program_id}
 POST /api/v1/admin/rules
 PUT  /api/v1/admin/rules/{rule_id}
@@ -236,6 +242,100 @@ POST /api/v1/admin/connectors/pos
 ```
 
 Admin keys must not be shipped to POS, storefront, mobile, or browser clients.
+
+## Policy Versions
+
+Vocabulary:
+
+- Program: the loyalty container for one business, region, or brand experience.
+- Policy: the configurable business behavior for earning, redemption, tiers, campaigns, expiry, referral, and consent.
+- Rule: one conditional statement inside a policy, such as a tier threshold or non-stacking campaign.
+- Policy version: a draftable, publishable snapshot. Previews and commits return the active policy version so POS, CRM, and agents can explain outcomes.
+
+Create a draft:
+
+```http
+POST /api/v1/admin/programs/demo/policy-versions
+Authorization: Bearer dev_admin_key
+Idempotency-Key: admin:policy:draft:2026-06-v2
+Content-Type: application/json
+```
+
+```json
+{
+  "name": "June policy refresh",
+  "version_label": "2026-06-v2",
+  "change_reason": "Raise earn rate for launch month and set minimum redemption.",
+  "policy": {
+    "earning": {
+      "eligible_amount_basis": "net_after_discount_excluding_tax",
+      "points_per_currency_unit": 2,
+      "currency_unit_minor": 100,
+      "rounding": "floor",
+      "earn_on_discounted_items": true
+    },
+    "redemption": {
+      "points_per_currency_unit": 100,
+      "currency_unit_minor": 100,
+      "minimum_points": 300,
+      "allow_partial_redemption": true
+    },
+    "tiers": {
+      "qualification_metric": "lifetime_points",
+      "thresholds": [
+        { "name": "Bronze", "threshold": 0 },
+        { "name": "Silver", "threshold": 1000 },
+        { "name": "Gold", "threshold": 5000 }
+      ]
+    },
+    "campaigns": {
+      "default_stack_mode": "base_plus_best_promo",
+      "max_promotional_rules_per_transaction": 1
+    },
+    "expiry": {
+      "mode": "after_inactivity",
+      "days": 365,
+      "notice_days": 30
+    },
+    "referral": {
+      "enabled": true,
+      "trigger_event": "first_completed_purchase",
+      "referrer_reward": { "points": 200 },
+      "referee_reward": { "cart_discount_minor": 500 }
+    },
+    "consent": {
+      "privacy_policy_version": "2026-06-privacy-v1",
+      "required_purposes": ["loyalty_operations", "marketing"]
+    },
+    "rules": [
+      {
+        "key": "birthday.non_stack",
+        "name": "Birthday offer does not stack with another promotional campaign",
+        "domain": "campaign",
+        "priority": 10,
+        "exclusive": true,
+        "conditions": { "campaign_key": "birthday" },
+        "effects": { "stack_group": "seasonal_bonus" }
+      }
+    ]
+  }
+}
+```
+
+Simulate before publishing:
+
+```http
+POST /api/v1/admin/programs/demo/policy-versions/{policy_version_id}/simulate
+```
+
+Publish after approval:
+
+```http
+POST /api/v1/admin/programs/demo/policy-versions/{policy_version_id}/publish
+Idempotency-Key: admin:policy:publish:2026-06-v2
+```
+
+Publishing retires the previous active policy version. Existing ledger entries remain unchanged; future previews and commits use the newly active policy.
 
 ## Commerce Summary
 

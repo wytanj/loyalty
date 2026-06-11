@@ -14,6 +14,7 @@ import {
   type MemberIdentity,
   type PointLedgerEntry,
   type Program,
+  type ProgramPolicyVersion,
   type RewardDefinition,
   type RewardKind,
   type RuleDefinition,
@@ -51,6 +52,7 @@ function parseIdentity(memberKey: string): MemberIdentity {
 
 export class MemoryLoyaltyStore {
   readonly programs = new Map<string, Program>();
+  readonly policyVersions = new Map<string, ProgramPolicyVersion>();
   readonly members = new Map<string, Member>();
   readonly memberIdentityIndex = new Map<string, string>();
   readonly rewards = new Map<string, RewardDefinition>();
@@ -178,6 +180,62 @@ export class MemoryLoyaltyStore {
       channels: ["web", "pos", "mobile", "marketplace"],
       active: true
     });
+    this.addPolicyVersion({
+      program_id: "demo",
+      status: "active",
+      name: "Default demo policy",
+      version_label: "2026-06-demo",
+      policy: {
+        earning: {
+          eligible_amount_basis: "net_after_discount_excluding_tax",
+          points_per_currency_unit: demoProgram.earn_rate.points_per_currency_unit,
+          currency_unit_minor: demoProgram.earn_rate.currency_unit_minor,
+          rounding: "floor",
+          earn_on_discounted_items: true,
+          excluded_line_tags: []
+        },
+        redemption: {
+          points_per_currency_unit: 100,
+          currency_unit_minor: 100,
+          minimum_points: 0,
+          allow_partial_redemption: true
+        },
+        tiers: {
+          qualification_metric: "lifetime_points",
+          thresholds: [
+            { name: "Bronze", threshold: 0, benefits: { multiplier: 1 } },
+            { name: "Silver", threshold: 1_000, benefits: { multiplier: 1.1 } },
+            { name: "Gold", threshold: 5_000, benefits: { multiplier: 1.25 } }
+          ]
+        },
+        campaigns: {
+          default_stack_mode: "base_plus_best_promo",
+          max_promotional_rules_per_transaction: 1,
+          exclusivity_groups: []
+        },
+        expiry: {
+          mode: "none",
+          notice_days: 30
+        },
+        referral: {
+          enabled: false,
+          trigger_event: "first_completed_purchase",
+          referrer_reward: {},
+          referee_reward: {},
+          cooldown_days: 0
+        },
+        consent: {
+          required_purposes: []
+        },
+        rules: [],
+        metadata: { source: "seed" }
+      },
+      change_reason: "Seed default demo earn and tier behavior",
+      effective_at: createdAt,
+      published_at: createdAt,
+      created_by: "system",
+      metadata: { source: "seed" }
+    });
 
     this.addApiKey("dev_pos_key", {
       workspace_id: "workspace_demo",
@@ -240,6 +298,78 @@ export class MemoryLoyaltyStore {
 
   getProgram(programId: string): Program | undefined {
     return this.programs.get(programId);
+  }
+
+  private nextPolicyVersion(programId: string): number {
+    return (
+      [...this.policyVersions.values()]
+        .filter((policyVersion) => policyVersion.program_id === programId)
+        .reduce((maxVersion, policyVersion) => Math.max(maxVersion, policyVersion.version), 0) + 1
+    );
+  }
+
+  addPolicyVersion(
+    input: Omit<ProgramPolicyVersion, "id" | "version" | "status" | "created_at" | "updated_at"> &
+      Partial<Pick<ProgramPolicyVersion, "id" | "version" | "status" | "created_at" | "updated_at">>
+  ): ProgramPolicyVersion {
+    const timestamp = nowIso();
+    const policyVersion: ProgramPolicyVersion = {
+      ...input,
+      id: input.id ?? makeId("polv"),
+      version: input.version ?? this.nextPolicyVersion(input.program_id),
+      status: input.status ?? "draft",
+      created_at: input.created_at ?? timestamp,
+      updated_at: input.updated_at ?? timestamp
+    };
+    this.policyVersions.set(policyVersion.id, policyVersion);
+    return policyVersion;
+  }
+
+  listPolicyVersions(programId: string): ProgramPolicyVersion[] {
+    return [...this.policyVersions.values()]
+      .filter((policyVersion) => policyVersion.program_id === programId)
+      .sort((a, b) => b.version - a.version);
+  }
+
+  getPolicyVersion(policyVersionId: string): ProgramPolicyVersion | undefined {
+    return this.policyVersions.get(policyVersionId);
+  }
+
+  getActivePolicyVersion(programId: string, asOf = nowIso()): ProgramPolicyVersion | undefined {
+    return this.listPolicyVersions(programId)
+      .filter((policyVersion) => policyVersion.status === "active")
+      .find((policyVersion) => !policyVersion.effective_at || policyVersion.effective_at <= asOf);
+  }
+
+  publishPolicyVersion(policyVersionId: string, input: { effective_at?: string; change_reason?: string } = {}): ProgramPolicyVersion | undefined {
+    const existing = this.policyVersions.get(policyVersionId);
+    if (!existing) {
+      return undefined;
+    }
+
+    const timestamp = nowIso();
+    for (const policyVersion of this.policyVersions.values()) {
+      if (policyVersion.program_id === existing.program_id && policyVersion.status === "active" && policyVersion.id !== existing.id) {
+        this.policyVersions.set(policyVersion.id, {
+          ...policyVersion,
+          status: "retired",
+          retired_at: timestamp,
+          updated_at: timestamp
+        });
+      }
+    }
+
+    const published: ProgramPolicyVersion = {
+      ...existing,
+      status: "active",
+      change_reason: input.change_reason ?? existing.change_reason,
+      effective_at: input.effective_at ?? existing.effective_at ?? timestamp,
+      published_at: timestamp,
+      retired_at: undefined,
+      updated_at: timestamp
+    };
+    this.policyVersions.set(published.id, published);
+    return published;
   }
 
   addReward(input: Omit<RewardDefinition, "id" | "created_at" | "updated_at">): RewardDefinition {

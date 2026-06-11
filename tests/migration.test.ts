@@ -12,6 +12,10 @@ const commerceFactsMigration = readFileSync(
   resolve(__dirname, "../core/db/migrations/0002_loyalty_commerce_facts.sql"),
   "utf8"
 );
+const policyVersionsMigration = readFileSync(
+  resolve(__dirname, "../core/db/migrations/0003_loyalty_policy_versions.sql"),
+  "utf8"
+);
 
 describe("initial migration", () => {
   it("contains the core table vocabulary from the brief", () => {
@@ -74,5 +78,14 @@ describe("initial migration", () => {
     expect(commerceFactsMigration).toContain("unique(program_id, claimed_reward_id)");
     expect(commerceFactsMigration).toContain("'web','pos','mobile','marketplace','social','agent','partner'");
     expect(commerceFactsMigration).toContain("alter table loyalty_sale_links enable row level security");
+  });
+
+  it("adds versioned program policies for draft, simulation, and publish workflows", () => {
+    expect(policyVersionsMigration).toContain("create table if not exists loyalty_program_policy_versions");
+    expect(policyVersionsMigration).toContain("status text not null default 'draft' check (status in ('draft','active','retired'))");
+    expect(policyVersionsMigration).toContain("policy jsonb not null");
+    expect(policyVersionsMigration).toContain("unique(program_id, version)");
+    expect(policyVersionsMigration).toContain("active_policy_version_id");
+    expect(policyVersionsMigration).toContain("alter table loyalty_program_policy_versions enable row level security");
   });
 });
