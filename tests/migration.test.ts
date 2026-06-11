@@ -8,6 +8,10 @@ const migration = readFileSync(
   resolve(__dirname, "../core/db/migrations/0001_initial_headless_loyalty.sql"),
   "utf8"
 );
+const commerceFactsMigration = readFileSync(
+  resolve(__dirname, "../core/db/migrations/0002_loyalty_commerce_facts.sql"),
+  "utf8"
+);
 
 describe("initial migration", () => {
   it("contains the core table vocabulary from the brief", () => {
@@ -61,5 +65,14 @@ describe("initial migration", () => {
     expect(migration).toContain("primary key(program_id, key)");
     expect(migration).toContain("payload_hash text not null");
     expect(migration).toContain("response_body jsonb not null");
+  });
+
+  it("adds commerce fact read models without replacing the ledger", () => {
+    expect(commerceFactsMigration).toContain("create table if not exists loyalty_sale_links");
+    expect(commerceFactsMigration).toContain("create table if not exists loyalty_reward_usage_facts");
+    expect(commerceFactsMigration).toContain("unique(program_id, member_id, source, external_sale_id)");
+    expect(commerceFactsMigration).toContain("unique(program_id, claimed_reward_id)");
+    expect(commerceFactsMigration).toContain("'web','pos','mobile','marketplace','social','agent','partner'");
+    expect(commerceFactsMigration).toContain("alter table loyalty_sale_links enable row level security");
   });
 });

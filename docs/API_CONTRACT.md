@@ -26,6 +26,8 @@ Customer-facing reads and writes require:
 channel=web|pos|mobile|marketplace|social|agent
 ```
 
+The generic channel set also includes `partner` for partner portals, referral partners, or external service partners that are not ordinary marketplace or social channels.
+
 Optional context:
 
 ```text
@@ -42,6 +44,7 @@ listing_id=<SKUMS listing id>
 ```text
 GET  /api/v1/{program_id}/configuration
 GET  /api/v1/{program_id}/members/{member_key}
+GET  /api/v1/{program_id}/members/{member_key}/commerce-summary
 POST /api/v1/{program_id}/members/{member_key}/sessions
 POST /api/v1/{program_id}/members/{member_key}/birthday
 POST /api/v1/{program_id}/members/{member_key}/consents/email-marketing
@@ -80,6 +83,68 @@ email_marketing_subscribed
 profile_completed
 custom_event
 ```
+
+## Source Event Envelope
+
+Cross-repo event writes use a stable envelope so POS, SKUMS, CRM, Loyalty, and future partners can exchange facts without double counting or losing provenance.
+
+```http
+POST /api/v1/demo/events
+Authorization: Bearer dev_pos_key
+Idempotency-Key: pos:store_001:txn_123
+Content-Type: application/json
+```
+
+```json
+{
+  "event_id": "pos_sale_123",
+  "event_type": "pos.sale.completed",
+  "workspace_id": "workspace_demo",
+  "source_system": "pos",
+  "occurred_at": "2026-06-11T04:00:00.000Z",
+  "idempotency_key": "pos:store_001:txn_123",
+  "actor": {
+    "type": "pos_register",
+    "id": "register_01"
+  },
+  "subject": {
+    "customer_key": "crm:person_123",
+    "external_customer_refs": [
+      { "system": "pos", "id": "cust_123" }
+    ]
+  },
+  "channel": "pos",
+  "country": "SG",
+  "currency": "SGD",
+  "location_id": "store_001",
+  "register_id": "register_01",
+  "schema_version": "2026-06-11",
+  "member_key": "crm:person_123",
+  "payload": {
+    "transaction_id": "txn_123",
+    "cart": {
+      "subtotal": 12800,
+      "discount_total": 1000,
+      "tax_total": 900,
+      "grand_total": 12700,
+      "items": []
+    }
+  }
+}
+```
+
+Required source systems:
+
+```text
+pos
+skums
+crm
+loyalty
+shopify
+custom
+```
+
+When the event type is `pos.sale.completed` or `skums.pos_sale.completed` and the payload contains a valid cart, Loyalty appends earn ledger rows. When the event type is `pos.return.completed` or `skums.pos_return.completed` and the payload references the original transaction, Loyalty appends reversal ledger rows.
 
 ## POS Sale Commit
 
@@ -160,6 +225,8 @@ PUT  /api/v1/admin/tiers/{tier_id}
 
 GET  /api/v1/admin/members?program_id={program_id}
 GET  /api/v1/admin/members/{member_id}
+GET  /api/v1/admin/members/{member_id}/ledger
+GET  /api/v1/admin/members/{member_id}/reward-usage
 POST /api/v1/admin/members/{member_id}/adjust-points
 
 GET  /api/v1/admin/connectors?program_id={program_id}
@@ -169,6 +236,38 @@ POST /api/v1/admin/connectors/pos
 ```
 
 Admin keys must not be shipped to POS, storefront, mobile, or browser clients.
+
+## Commerce Summary
+
+```http
+GET /api/v1/demo/members/crm:person_123/commerce-summary?channel=pos&currency=SGD
+Authorization: Bearer dev_pos_key
+```
+
+The commerce summary is a read model around loyalty economics. It is not the source of truth; the append-only point ledger remains the economic truth.
+
+```json
+{
+  "member": {},
+  "summary": {
+    "currency": "SGD",
+    "sale_count": 1,
+    "active_sale_count": 1,
+    "reversed_sale_count": 0,
+    "gross_sale_total_minor": 12700,
+    "net_sale_total_minor": 12700,
+    "discount_total_minor": 1000,
+    "points_earned": 118,
+    "points_reversed": 0,
+    "net_points_earned": 118,
+    "points_redeemed": 500,
+    "points_refunded": 0,
+    "reward_usage_count": 1
+  },
+  "sale_links": [],
+  "reward_usage": []
+}
+```
 
 ## Webhooks
 

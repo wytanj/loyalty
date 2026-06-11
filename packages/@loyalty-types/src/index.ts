@@ -5,6 +5,7 @@ export {
   eventTypes,
   rewardKinds,
   ruleKinds,
+  sourceSystems,
   type ApiErrorCode,
   type ApiScope,
   type Cart,
@@ -13,5 +14,6 @@ export {
   type EventType,
   type RequestContext,
   type RewardKind,
-  type RuleKind
+  type RuleKind,
+  type SourceSystem
 } from "../../../server/utils/contracts";

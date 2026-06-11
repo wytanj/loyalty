@@ -5,10 +5,14 @@ import {
   adminAdjustPoints,
   commitEarn,
   completeRule,
+  getAdminLedger,
+  getAdminRewardUsage,
+  getCommerceSummary,
   getMember,
   ingestEvent,
   initializeSession,
   previewEarn,
+  refundReward,
   redeemReward,
   reverseEarn
 } from "@server/utils/services";
@@ -51,6 +55,14 @@ describe("headless loyalty contracts", () => {
       idempotency_key: "pos:event:123",
       event_id: "evt_123",
       event_type: "pos.sale.completed",
+      workspace_id: "workspace_demo",
+      source_system: "pos",
+      actor: { type: "pos_register", id: "register_01" },
+      subject: {
+        customer_key: "crm:person_123",
+        external_customer_refs: [{ system: "pos", id: "cust_123" }]
+      },
+      schema_version: "2026-06-11",
       member_key: "crm:person_123",
       channel: "pos",
       payload: {
@@ -94,9 +106,17 @@ describe("headless loyalty contracts", () => {
       transaction_id: "txn_123",
       idempotency_key: "pos:store_001:txn_123",
       metadata: {}
-    }) as { member: { wallet: { points_balance: number } } };
+    }) as {
+      member: { wallet: { points_balance: number } };
+      sale_link: { external_sale_id: string; sale_total_minor: number; points_earned: number; reversed_at?: string };
+    };
 
     expect(commit.member.wallet.points_balance).toBe(118);
+    expect(commit.sale_link).toMatchObject({
+      external_sale_id: "txn_123",
+      sale_total_minor: 12_700,
+      points_earned: 118
+    });
 
     const reversal = reverseEarn("demo", {
       member_key: "crm:person_123",
@@ -106,11 +126,22 @@ describe("headless loyalty contracts", () => {
       return_id: "return_123",
       idempotency_key: "pos_return:store_001:return_123",
       metadata: {}
-    }) as { member: { wallet: { points_balance: number } } };
+    }) as { member: { wallet: { points_balance: number } }; sale_link?: { reversed_at?: string } };
 
     expect(reversal.member.wallet.points_balance).toBe(0);
+    expect(reversal.sale_link?.reversed_at).toBeTruthy();
     expect(useLoyaltyStore().listLedgerEntries("demo")).toHaveLength(2);
     expect(useLoyaltyStore().listLedgerEntries("demo").map((entry) => entry.kind)).toEqual(["earn", "reverse"]);
+
+    const summary = getCommerceSummary("demo", "crm:person_123", { channel: "pos", currency: "SGD" }) as {
+      summary: { sale_count: number; reversed_sale_count: number; net_sale_total_minor: number; points_reversed: number };
+    };
+    expect(summary.summary).toMatchObject({
+      sale_count: 1,
+      reversed_sale_count: 1,
+      net_sale_total_minor: 0,
+      points_reversed: 118
+    });
   });
 
   it("redeems a product reward through the SKUMS-aware reward kind", () => {
@@ -132,17 +163,42 @@ describe("headless loyalty contracts", () => {
       channel: "pos",
       currency: "SGD",
       idempotency_key: "pos_redeem:txn_123:product_reward",
-      metadata: {}
+      metadata: {
+        external_sale_id: "txn_123"
+      }
     }) as {
       member: { wallet: { points_balance: number }; reward_count: number };
+      claimed_reward: { id: string };
+      reward_usage: { status: string; points_cost: number; external_sale_id?: string };
       redemption: { code: string; one_time_visible: boolean };
     };
 
     expect(redemption.member.wallet.points_balance).toBe(200);
+    expect(redemption.reward_usage).toMatchObject({
+      status: "issued",
+      points_cost: 800,
+      external_sale_id: "txn_123"
+    });
     expect(redemption.redemption.one_time_visible).toBe(true);
     expect(useLoyaltyStore().events.some((event) => event.event_type === "loyalty.product_reward.reservation_requested")).toBe(
       true
     );
+
+    const refund = refundReward("demo", "product_reward", {
+      member_key: "crm:person_123",
+      channel: "pos",
+      currency: "SGD",
+      claimed_reward_id: redemption.claimed_reward.id,
+      refund_id: "refund_reward_123",
+      idempotency_key: "pos_reward_refund:txn_123:product_reward",
+      metadata: {}
+    }) as { member: { wallet: { points_balance: number } }; reward_usage: { status: string; external_sale_id?: string } };
+
+    expect(refund.member.wallet.points_balance).toBe(1_000);
+    expect(refund.reward_usage).toMatchObject({
+      status: "refunded",
+      external_sale_id: "txn_123"
+    });
   });
 
   it("rejects duplicate rule completions as shopper-facing business state", () => {
@@ -174,6 +230,14 @@ describe("headless loyalty contracts", () => {
     ingestEvent("demo", {
       event_id: "evt_sale_1",
       event_type: "pos.sale.completed",
+      workspace_id: "workspace_demo",
+      source_system: "pos",
+      actor: { type: "pos_register", id: "register_01" },
+      subject: {
+        customer_key: "crm:person_123",
+        external_customer_refs: [{ system: "pos", id: "cust_123" }]
+      },
+      schema_version: "2026-06-11",
       member_key: "crm:person_123",
       channel: "pos",
       currency: "SGD",
@@ -186,6 +250,14 @@ describe("headless loyalty contracts", () => {
     ingestEvent("demo", {
       event_id: "evt_return_1",
       event_type: "pos.return.completed",
+      workspace_id: "workspace_demo",
+      source_system: "pos",
+      actor: { type: "pos_register", id: "register_01" },
+      subject: {
+        customer_key: "crm:person_123",
+        external_customer_refs: [{ system: "pos", id: "cust_123" }]
+      },
+      schema_version: "2026-06-11",
       member_key: "crm:person_123",
       channel: "pos",
       currency: "SGD",
@@ -201,5 +273,55 @@ describe("headless loyalty contracts", () => {
     };
     expect(member.member.wallet.points_balance).toBe(0);
     expect(useLoyaltyStore().listLedgerEntries("demo")).toHaveLength(2);
+    expect(useLoyaltyStore().listSaleLinks("demo")).toHaveLength(1);
+  });
+
+  it("exposes admin ledger and reward usage read models", () => {
+    commitEarn("demo", {
+      member_key: "crm:person_123",
+      channel: "pos",
+      currency: "SGD",
+      cart,
+      transaction_id: "txn_admin_read_1",
+      idempotency_key: "pos:store_001:txn_admin_read_1",
+      metadata: {}
+    });
+    const member = useLoyaltyStore().listMembers("demo")[0]!;
+    adminAdjustPoints(member.id, {
+      idempotency_key: "admin:test:grant:read",
+      points: 1_000,
+      reason: "test grant",
+      metadata: {}
+    });
+    redeemReward("demo", "cart_discount", {
+      member_key: "crm:person_123",
+      channel: "pos",
+      currency: "SGD",
+      idempotency_key: "pos_redeem:txn_admin_read_1:cart_discount",
+      metadata: {
+        external_sale_id: "txn_admin_read_1"
+      }
+    });
+
+    const ledger = getAdminLedger(member.id) as {
+      ledger_entries: Array<{ kind: string }>;
+      totals: { points_earned: number; reward_points_spent: number };
+    };
+    const rewardUsage = getAdminRewardUsage(member.id) as {
+      reward_usage: Array<{ status: string; external_sale_id?: string }>;
+      totals: { issued_count: number; points_cost: number };
+    };
+
+    expect(ledger.ledger_entries.map((entry) => entry.kind)).toContain("earn");
+    expect(ledger.totals.points_earned).toBe(118);
+    expect(ledger.totals.reward_points_spent).toBe(500);
+    expect(rewardUsage.totals).toMatchObject({
+      issued_count: 1,
+      points_cost: 500
+    });
+    expect(rewardUsage.reward_usage[0]).toMatchObject({
+      status: "issued",
+      external_sale_id: "txn_admin_read_1"
+    });
   });
 });

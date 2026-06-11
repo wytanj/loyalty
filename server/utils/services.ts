@@ -5,6 +5,8 @@ import {
   type ConnectorAccount,
   type EventType,
   type LoyaltyEvent,
+  type LoyaltyRewardUsageFact,
+  type LoyaltySaleLink,
   type Member,
   type PointLedgerEntry,
   type Program,
@@ -13,6 +15,7 @@ import {
   type RewardKind,
   type RuleDefinition,
   type RuleKind,
+  type SourceSystem,
   type TierDefinition,
   type WebhookSubscription
 } from "./contracts";
@@ -67,6 +70,11 @@ interface EventIngestInput extends RequestContext {
   idempotency_key?: string;
   event_id: string;
   event_type: EventType;
+  workspace_id: string;
+  source_system: SourceSystem;
+  actor: Record<string, unknown>;
+  subject: Record<string, unknown>;
+  schema_version: string;
   member_key?: string;
   occurred_at?: string;
   payload: Record<string, unknown>;
@@ -169,6 +177,42 @@ function responseRule(rule: RuleDefinition): Record<string, unknown> {
   };
 }
 
+function responseSaleLink(saleLink: LoyaltySaleLink): Record<string, unknown> {
+  return {
+    id: saleLink.id,
+    external_sale_id: saleLink.external_sale_id,
+    source: saleLink.source,
+    channel: saleLink.channel,
+    currency: saleLink.currency,
+    sale_total_minor: saleLink.sale_total_minor,
+    discount_total_minor: saleLink.discount_total_minor,
+    points_earned: saleLink.points_earned,
+    points_redeemed: saleLink.points_redeemed,
+    occurred_at: saleLink.occurred_at,
+    reversed_at: saleLink.reversed_at,
+    metadata: saleLink.metadata
+  };
+}
+
+function responseRewardUsageFact(fact: LoyaltyRewardUsageFact): Record<string, unknown> {
+  return {
+    id: fact.id,
+    claimed_reward_id: fact.claimed_reward_id,
+    reward_id: fact.reward_id,
+    reward_kind: fact.reward_kind,
+    external_sale_id: fact.external_sale_id,
+    source: fact.source,
+    channel: fact.channel,
+    currency: fact.currency,
+    points_cost: fact.points_cost,
+    discount_minor: fact.discount_minor,
+    status: fact.status,
+    occurred_at: fact.occurred_at,
+    refunded_at: fact.refunded_at,
+    metadata: fact.metadata
+  };
+}
+
 function availableRewards(programId: string, member: Member, context: RequestContext): RewardDefinition[] {
   return useLoyaltyStore()
     .listRewards(programId)
@@ -221,10 +265,19 @@ function emitInternalEvent(
   eventType: EventType,
   input: { member?: Member; member_key?: string; channel: Channel; occurred_at?: string; payload?: Record<string, unknown> }
 ): LoyaltyEvent {
+  const program = assertProgram(programId);
   return useLoyaltyStore().addEvent({
     program_id: programId,
     event_id: `${eventType}:${Date.now()}:${Math.random().toString(36).slice(2)}`,
     event_type: eventType,
+    workspace_id: program.workspace_id,
+    source_system: "loyalty",
+    actor: { type: "system", id: "loyalty" },
+    subject: {
+      customer_key: input.member_key,
+      external_customer_refs: []
+    },
+    schema_version: "2026-06-11",
     member_id: input.member?.id,
     member_key: input.member_key,
     channel: input.channel,
@@ -420,6 +473,7 @@ export function commitEarn(programId: string, input: EarnCommitInput): Record<st
   }
 
   const preview = previewEarn(programId, input) as { points: number };
+  const currency = input.currency ?? program.default_currency;
   const ledgerEntry = useLoyaltyStore().appendLedgerEntry({
     program_id: programId,
     member_id: member.id,
@@ -437,6 +491,26 @@ export function commitEarn(programId: string, input: EarnCommitInput): Record<st
     }
   });
   const saved = applyLedgerToMember(member, ledgerEntry);
+  const saleLink = useLoyaltyStore().upsertSaleLink({
+    program_id: programId,
+    member_id: saved.id,
+    external_sale_id: input.transaction_id,
+    source: stringFromRecord(input.metadata, "source_system") ?? input.channel,
+    channel: input.channel,
+    currency,
+    sale_total_minor: input.cart.grand_total,
+    discount_total_minor: input.cart.discount_total,
+    points_earned: ledgerEntry.points,
+    points_redeemed: numberFromRecord(input.metadata, "points_redeemed"),
+    occurred_at: ledgerEntry.occurred_at,
+    idempotency_key: input.idempotency_key,
+    metadata: {
+      cart: input.cart,
+      context: contextForMetadata(input),
+      source_event_id: stringFromRecord(input.metadata, "source_event_id"),
+      input_metadata: input.metadata
+    }
+  });
 
   emitInternalEvent(programId, "loyalty.points.earned", {
     member: saved,
@@ -452,6 +526,7 @@ export function commitEarn(programId: string, input: EarnCommitInput): Record<st
   return {
     member: responseMember(saved),
     ledger_entry: ledgerEntry,
+    sale_link: responseSaleLink(saleLink),
     earn: preview
   };
 }
@@ -495,6 +570,17 @@ export function reverseEarn(programId: string, input: EarnReverseInput): Record<
     }
   });
   const saved = applyLedgerToMember(member, ledgerEntry);
+  const saleLink = useLoyaltyStore().markSaleLinkReversed({
+    program_id: programId,
+    member_id: saved.id,
+    source: stringFromRecord(input.metadata, "source_system") ?? input.channel,
+    external_sale_id: input.original_transaction_id,
+    reversed_at: ledgerEntry.occurred_at,
+    metadata: {
+      return_id: input.return_id,
+      reversal_ledger_entry_id: ledgerEntry.id
+    }
+  });
 
   emitInternalEvent(programId, "loyalty.points.reversed", {
     member: saved,
@@ -510,7 +596,8 @@ export function reverseEarn(programId: string, input: EarnReverseInput): Record<
 
   return {
     member: responseMember(saved),
-    ledger_entry: ledgerEntry
+    ledger_entry: ledgerEntry,
+    sale_link: saleLink ? responseSaleLink(saleLink) : undefined
   };
 }
 
@@ -596,6 +683,28 @@ export function redeemReward(programId: string, rewardKind: RewardKind, input: R
     useLoyaltyStore().updateReward(reward.id, { inventory: reward.inventory - 1 });
   }
 
+  const rewardUsage = useLoyaltyStore().upsertRewardUsageFact({
+    program_id: programId,
+    member_id: memberWithRewardCount.id,
+    claimed_reward_id: claimed.id,
+    reward_id: reward.id,
+    reward_kind: reward.kind,
+    external_sale_id: stringFromRecord(input.metadata, "external_sale_id") ?? stringFromRecord(input.metadata, "transaction_id"),
+    source: stringFromRecord(input.metadata, "source_system") ?? input.channel,
+    channel: input.channel,
+    currency: input.currency,
+    points_cost: reward.cost_points,
+    discount_minor: numberFromRecord(input.metadata, "discount_minor", rewardDiscountMinor(reward)),
+    status: "issued",
+    occurred_at: claimed.issued_at,
+    metadata: {
+      context: contextForMetadata(input),
+      reward_value: reward.value,
+      skums_refs: reward.skums_refs,
+      input_metadata: input.metadata
+    }
+  });
+
   emitInternalEvent(programId, "loyalty.reward.claimed", {
     member: memberWithRewardCount,
     member_key: input.member_key,
@@ -623,6 +732,7 @@ export function redeemReward(programId: string, rewardKind: RewardKind, input: R
     member: responseMember(memberWithRewardCount),
     reward: responseReward(reward, memberWithRewardCount),
     claimed_reward: claimed,
+    reward_usage: responseRewardUsageFact(rewardUsage),
     redemption: {
       code,
       one_time_visible: true,
@@ -651,6 +761,7 @@ export function refundReward(programId: string, rewardKind: RewardKind, input: R
     status: "refunded",
     refunded_at: new Date().toISOString()
   });
+  const existingRewardUsage = useLoyaltyStore().getRewardUsageFactByClaimedReward(updatedClaim.id);
   const ledgerEntry =
     claimed.cost_points > 0
       ? useLoyaltyStore().appendLedgerEntry({
@@ -669,6 +780,30 @@ export function refundReward(programId: string, rewardKind: RewardKind, input: R
         })
       : undefined;
   const saved = ledgerEntry ? applyLedgerToMember(member, ledgerEntry) : useLoyaltyStore().saveMember(member);
+  const rewardUsage = useLoyaltyStore().upsertRewardUsageFact({
+    program_id: programId,
+    member_id: member.id,
+    claimed_reward_id: updatedClaim.id,
+    reward_id: updatedClaim.reward_id,
+    reward_kind: updatedClaim.kind,
+    external_sale_id:
+      stringFromRecord(input.metadata, "external_sale_id") ??
+      stringFromRecord(input.metadata, "transaction_id") ??
+      existingRewardUsage?.external_sale_id,
+    source: stringFromRecord(input.metadata, "source_system") ?? existingRewardUsage?.source ?? input.channel,
+    channel: input.channel,
+    currency: input.currency ?? existingRewardUsage?.currency,
+    points_cost: updatedClaim.cost_points,
+    discount_minor: numberFromRecord(input.metadata, "discount_minor", existingRewardUsage?.discount_minor ?? 0),
+    status: "refunded",
+    occurred_at: updatedClaim.issued_at,
+    refunded_at: updatedClaim.refunded_at,
+    metadata: {
+      refund_id: input.refund_id,
+      context: contextForMetadata(input),
+      input_metadata: input.metadata
+    }
+  });
 
   emitInternalEvent(programId, "loyalty.reward.redeemed", {
     member: saved,
@@ -684,6 +819,7 @@ export function refundReward(programId: string, rewardKind: RewardKind, input: R
   return {
     member: responseMember(saved),
     claimed_reward: updatedClaim,
+    reward_usage: responseRewardUsageFact(rewardUsage),
     ledger_entry: ledgerEntry
   };
 }
@@ -739,6 +875,11 @@ export function ingestEvent(programId: string, input: EventIngestInput): Record<
     program_id: programId,
     event_id: input.event_id,
     event_type: input.event_type,
+    workspace_id: input.workspace_id,
+    source_system: input.source_system,
+    actor: input.actor,
+    subject: input.subject,
+    schema_version: input.schema_version,
     member_id: member?.id,
     member_key: input.member_key,
     channel: input.channel,
@@ -756,7 +897,7 @@ export function ingestEvent(programId: string, input: EventIngestInput): Record<
         member_key: input.member_key,
         cart,
         transaction_id: transactionId,
-        metadata: { source_event_id: input.event_id }
+        metadata: { source_event_id: input.event_id, source_system: input.source_system }
       });
       processed_actions.push("points_earned");
     }
@@ -771,7 +912,7 @@ export function ingestEvent(programId: string, input: EventIngestInput): Record<
         member_key: input.member_key,
         original_transaction_id: originalTransactionId,
         return_id: String(returnId),
-        metadata: { source_event_id: input.event_id }
+        metadata: { source_event_id: input.event_id, source_system: input.source_system }
       });
       processed_actions.push("points_reversed");
     }
@@ -814,7 +955,104 @@ export function getAdminMember(memberId: string): Record<string, unknown> {
   return {
     member,
     ledger_entries: useLoyaltyStore().listLedgerEntries(member.program_id, member.id),
-    claimed_rewards: useLoyaltyStore().listClaimedRewards(member.program_id, member.id)
+    claimed_rewards: useLoyaltyStore().listClaimedRewards(member.program_id, member.id),
+    sale_links: useLoyaltyStore().listSaleLinks(member.program_id, member.id).map((saleLink) => responseSaleLink(saleLink)),
+    reward_usage: useLoyaltyStore()
+      .listRewardUsageFacts(member.program_id, member.id)
+      .map((fact) => responseRewardUsageFact(fact))
+  };
+}
+
+export function getCommerceSummary(programId: string, memberKey: string, context: RequestContext): Record<string, unknown> {
+  const program = assertProgram(programId);
+  assertChannel(program, context.channel);
+  const member = memberOrBusinessError(programId, memberKey);
+  const saleLinks = useLoyaltyStore().listSaleLinks(programId, member.id);
+  const rewardUsage = useLoyaltyStore().listRewardUsageFacts(programId, member.id);
+  const ledgerEntries = useLoyaltyStore().listLedgerEntries(programId, member.id);
+  const activeSales = saleLinks.filter((saleLink) => !saleLink.reversed_at);
+  const reversedSales = saleLinks.filter((saleLink) => Boolean(saleLink.reversed_at));
+  const pointsEarned = ledgerEntries
+    .filter((entry) => entry.kind === "earn")
+    .reduce((sum, entry) => sum + entry.points, 0);
+  const pointsReversed = Math.abs(
+    ledgerEntries.filter((entry) => entry.kind === "reverse").reduce((sum, entry) => sum + entry.points, 0)
+  );
+  const pointsRedeemed = rewardUsage
+    .filter((fact) => fact.status === "issued" || fact.status === "redeemed")
+    .reduce((sum, fact) => sum + fact.points_cost, 0);
+  const pointsRefunded = rewardUsage
+    .filter((fact) => fact.status === "refunded")
+    .reduce((sum, fact) => sum + fact.points_cost, 0);
+
+  return {
+    member: responseMember(member),
+    summary: {
+      currency: context.currency ?? program.default_currency,
+      sale_count: saleLinks.length,
+      active_sale_count: activeSales.length,
+      reversed_sale_count: reversedSales.length,
+      gross_sale_total_minor: sumBy(saleLinks, "sale_total_minor"),
+      net_sale_total_minor: sumBy(activeSales, "sale_total_minor"),
+      discount_total_minor: sumBy(activeSales, "discount_total_minor"),
+      points_earned: pointsEarned,
+      points_reversed: pointsReversed,
+      net_points_earned: pointsEarned - pointsReversed,
+      points_redeemed: pointsRedeemed,
+      points_refunded: pointsRefunded,
+      reward_usage_count: rewardUsage.length,
+      last_sale_at: saleLinks[0]?.occurred_at,
+      first_sale_at: saleLinks.at(-1)?.occurred_at
+    },
+    sale_links: saleLinks.map((saleLink) => responseSaleLink(saleLink)),
+    reward_usage: rewardUsage.map((fact) => responseRewardUsageFact(fact))
+  };
+}
+
+export function getAdminLedger(memberId: string): Record<string, unknown> {
+  const member = useLoyaltyStore().findMemberById(memberId);
+  if (!member) {
+    throw notFound("Member was not found");
+  }
+
+  const ledgerEntries = useLoyaltyStore().listLedgerEntries(member.program_id, member.id);
+  return {
+    member: responseMember(member),
+    ledger_entries: ledgerEntries,
+    totals: {
+      points_earned: ledgerEntries.filter((entry) => entry.kind === "earn").reduce((sum, entry) => sum + entry.points, 0),
+      points_reversed: Math.abs(
+        ledgerEntries.filter((entry) => entry.kind === "reverse").reduce((sum, entry) => sum + entry.points, 0)
+      ),
+      reward_points_spent: Math.abs(
+        ledgerEntries.filter((entry) => entry.kind === "reward_redeem").reduce((sum, entry) => sum + entry.points, 0)
+      ),
+      reward_points_refunded: ledgerEntries
+        .filter((entry) => entry.kind === "reward_refund")
+        .reduce((sum, entry) => sum + entry.points, 0),
+      admin_adjustment_points: ledgerEntries
+        .filter((entry) => entry.kind === "admin_adjust")
+        .reduce((sum, entry) => sum + entry.points, 0)
+    }
+  };
+}
+
+export function getAdminRewardUsage(memberId: string): Record<string, unknown> {
+  const member = useLoyaltyStore().findMemberById(memberId);
+  if (!member) {
+    throw notFound("Member was not found");
+  }
+
+  const rewardUsage = useLoyaltyStore().listRewardUsageFacts(member.program_id, member.id);
+  return {
+    member: responseMember(member),
+    reward_usage: rewardUsage.map((fact) => responseRewardUsageFact(fact)),
+    totals: {
+      issued_count: rewardUsage.filter((fact) => fact.status === "issued").length,
+      refunded_count: rewardUsage.filter((fact) => fact.status === "refunded").length,
+      points_cost: rewardUsage.reduce((sum, fact) => sum + fact.points_cost, 0),
+      discount_minor: rewardUsage.reduce((sum, fact) => sum + fact.discount_minor, 0)
+    }
   };
 }
 
@@ -958,6 +1196,25 @@ function contextForMetadata(input: RequestContext): Record<string, unknown> {
     register_id: input.register_id,
     listing_id: input.listing_id
   };
+}
+
+function numberFromRecord(record: Record<string, unknown>, key: string, fallback = 0): number {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+function rewardDiscountMinor(reward: RewardDefinition): number {
+  const amountMinor = reward.value.amount_minor;
+  return typeof amountMinor === "number" && Number.isFinite(amountMinor) ? amountMinor : 0;
+}
+
+function sumBy<T extends Record<TKey, number>, TKey extends string>(items: T[], key: TKey): number {
+  return items.reduce((sum, item) => sum + item[key], 0);
 }
 
 function isCart(value: unknown): value is Cart {

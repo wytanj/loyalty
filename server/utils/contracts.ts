@@ -1,6 +1,7 @@
 import { z } from "zod";
 
-export const channels = ["web", "pos", "mobile", "marketplace", "social", "agent"] as const;
+export const channels = ["web", "pos", "mobile", "marketplace", "social", "agent", "partner"] as const;
+export const sourceSystems = ["pos", "skums", "crm", "loyalty", "shopify", "custom"] as const;
 export const rewardKinds = [
   "cart_discount",
   "free_shipping",
@@ -100,12 +101,14 @@ export type RuleKind = (typeof ruleKinds)[number];
 export type EventType = (typeof eventTypes)[number];
 export type ApiScope = (typeof apiScopes)[number];
 export type ApiErrorCode = (typeof apiErrorCodes)[number];
+export type SourceSystem = (typeof sourceSystems)[number];
 
 export const channelSchema = z.enum(channels);
 export const rewardKindSchema = z.enum(rewardKinds);
 export const ruleKindSchema = z.enum(ruleKinds);
 export const eventTypeSchema = z.enum(eventTypes);
 export const apiScopeSchema = z.enum(apiScopes);
+export const sourceSystemSchema = z.enum(sourceSystems);
 
 const optionalTrimmed = z.string().trim().min(1).optional();
 const countrySchema = z
@@ -146,6 +149,31 @@ export const memberKeySchema = z
   .max(300)
   .regex(/^[a-z0-9_-]+:.+$/i, "member_key must use a namespace prefix, for example crm:person_123");
 export const moneyMinorSchema = z.number().int().min(0).max(100_000_000_000);
+
+export const eventActorSchema = z
+  .object({
+    type: z.string().trim().min(1),
+    id: optionalTrimmed
+  })
+  .passthrough()
+  .default({ type: "system" });
+
+export const eventSubjectSchema = z
+  .object({
+    customer_key: memberKeySchema.optional(),
+    external_customer_refs: z
+      .array(
+        z
+          .object({
+            system: z.string().trim().min(1),
+            id: z.string().trim().min(1)
+          })
+          .passthrough()
+      )
+      .default([])
+  })
+  .passthrough()
+  .default({ external_customer_refs: [] });
 
 export const cartLineItemSchema = z.object({
   line_id: z.string().trim().min(1),
@@ -233,6 +261,11 @@ export const eventIngestRequestSchema = requestContextSchema.extend({
   idempotency_key: idempotencyKeySchema.optional(),
   event_id: z.string().trim().min(1).max(240),
   event_type: eventTypeSchema,
+  workspace_id: z.string().trim().min(1).max(120).default("workspace_demo"),
+  source_system: sourceSystemSchema,
+  actor: eventActorSchema,
+  subject: eventSubjectSchema,
+  schema_version: z.string().trim().min(1).max(40).default("2026-06-11"),
   member_key: memberKeySchema.optional(),
   occurred_at: z.string().datetime().optional(),
   payload: z.record(z.unknown()).default({})
@@ -425,11 +458,57 @@ export interface PointLedgerEntry {
   metadata: Record<string, unknown>;
 }
 
+export interface LoyaltySaleLink {
+  id: string;
+  program_id: string;
+  member_id: string;
+  external_sale_id: string;
+  source: string;
+  channel: Channel;
+  currency: string;
+  sale_total_minor: number;
+  discount_total_minor: number;
+  points_earned: number;
+  points_redeemed: number;
+  occurred_at: string;
+  reversed_at?: string;
+  idempotency_key?: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LoyaltyRewardUsageFact {
+  id: string;
+  program_id: string;
+  member_id: string;
+  claimed_reward_id: string;
+  reward_id: string;
+  reward_kind: RewardKind;
+  external_sale_id?: string;
+  source: string;
+  channel: Channel;
+  currency?: string;
+  points_cost: number;
+  discount_minor: number;
+  status: "issued" | "redeemed" | "refunded" | "voided";
+  occurred_at: string;
+  refunded_at?: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface LoyaltyEvent {
   id: string;
   program_id: string;
   event_id: string;
   event_type: EventType;
+  workspace_id: string;
+  source_system: SourceSystem;
+  actor: Record<string, unknown>;
+  subject: Record<string, unknown>;
+  schema_version: string;
   member_id?: string;
   member_key?: string;
   channel: Channel;

@@ -8,6 +8,8 @@ import {
   type EventType,
   type IdempotencyRecord,
   type LoyaltyEvent,
+  type LoyaltyRewardUsageFact,
+  type LoyaltySaleLink,
   type Member,
   type MemberIdentity,
   type PointLedgerEntry,
@@ -53,6 +55,10 @@ export class MemoryLoyaltyStore {
   readonly memberIdentityIndex = new Map<string, string>();
   readonly rewards = new Map<string, RewardDefinition>();
   readonly claimedRewards = new Map<string, ClaimedReward>();
+  readonly saleLinks = new Map<string, LoyaltySaleLink>();
+  readonly saleLinkIndex = new Map<string, string>();
+  readonly rewardUsageFacts = new Map<string, LoyaltyRewardUsageFact>();
+  readonly rewardUsageByClaimedReward = new Map<string, string>();
   readonly rules = new Map<string, RuleDefinition>();
   readonly ruleCompletions = new Map<string, { id: string; program_id: string; member_id: string; rule_kind: RuleKind; completed_at: string }>();
   readonly tiers = new Map<string, TierDefinition>();
@@ -421,6 +427,62 @@ export class MemoryLoyaltyStore {
     );
   }
 
+  private saleLinkIndexKey(programId: string, memberId: string, source: string, externalSaleId: string): string {
+    return `${programId}:${memberId}:${source}:${externalSaleId}`.toLowerCase();
+  }
+
+  upsertSaleLink(
+    input: Omit<LoyaltySaleLink, "id" | "created_at" | "updated_at"> & { id?: string; created_at?: string; updated_at?: string }
+  ): LoyaltySaleLink {
+    const indexKey = this.saleLinkIndexKey(input.program_id, input.member_id, input.source, input.external_sale_id);
+    const existingId = this.saleLinkIndex.get(indexKey);
+    const existing = existingId ? this.saleLinks.get(existingId) : undefined;
+    const timestamp = nowIso();
+    const saleLink: LoyaltySaleLink = {
+      ...input,
+      id: existing?.id ?? input.id ?? makeId("sale"),
+      created_at: existing?.created_at ?? input.created_at ?? timestamp,
+      updated_at: timestamp
+    };
+    this.saleLinks.set(saleLink.id, saleLink);
+    this.saleLinkIndex.set(indexKey, saleLink.id);
+    return saleLink;
+  }
+
+  markSaleLinkReversed(input: {
+    program_id: string;
+    member_id: string;
+    source: string;
+    external_sale_id: string;
+    reversed_at?: string;
+    metadata?: Record<string, unknown>;
+  }): LoyaltySaleLink | undefined {
+    const indexKey = this.saleLinkIndexKey(input.program_id, input.member_id, input.source, input.external_sale_id);
+    const existingId = this.saleLinkIndex.get(indexKey);
+    const existing = existingId ? this.saleLinks.get(existingId) : undefined;
+    if (!existing) {
+      return undefined;
+    }
+
+    const reversed = {
+      ...existing,
+      reversed_at: input.reversed_at ?? nowIso(),
+      metadata: {
+        ...existing.metadata,
+        ...(input.metadata ?? {})
+      },
+      updated_at: nowIso()
+    };
+    this.saleLinks.set(reversed.id, reversed);
+    return reversed;
+  }
+
+  listSaleLinks(programId: string, memberId?: string): LoyaltySaleLink[] {
+    return [...this.saleLinks.values()]
+      .filter((saleLink) => saleLink.program_id === programId && (!memberId || saleLink.member_id === memberId))
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
+  }
+
   addClaimedReward(input: Omit<ClaimedReward, "id" | "issued_at">): ClaimedReward {
     const claimed: ClaimedReward = {
       ...input,
@@ -444,6 +506,38 @@ export class MemoryLoyaltyStore {
 
   getClaimedReward(claimedRewardId: string): ClaimedReward | undefined {
     return this.claimedRewards.get(claimedRewardId);
+  }
+
+  upsertRewardUsageFact(
+    input: Omit<LoyaltyRewardUsageFact, "id" | "created_at" | "updated_at"> & {
+      id?: string;
+      created_at?: string;
+      updated_at?: string;
+    }
+  ): LoyaltyRewardUsageFact {
+    const existingId = this.rewardUsageByClaimedReward.get(input.claimed_reward_id);
+    const existing = existingId ? this.rewardUsageFacts.get(existingId) : undefined;
+    const timestamp = nowIso();
+    const fact: LoyaltyRewardUsageFact = {
+      ...input,
+      id: existing?.id ?? input.id ?? makeId("rusage"),
+      created_at: existing?.created_at ?? input.created_at ?? timestamp,
+      updated_at: timestamp
+    };
+    this.rewardUsageFacts.set(fact.id, fact);
+    this.rewardUsageByClaimedReward.set(fact.claimed_reward_id, fact.id);
+    return fact;
+  }
+
+  listRewardUsageFacts(programId: string, memberId?: string): LoyaltyRewardUsageFact[] {
+    return [...this.rewardUsageFacts.values()]
+      .filter((fact) => fact.program_id === programId && (!memberId || fact.member_id === memberId))
+      .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
+  }
+
+  getRewardUsageFactByClaimedReward(claimedRewardId: string): LoyaltyRewardUsageFact | undefined {
+    const factId = this.rewardUsageByClaimedReward.get(claimedRewardId);
+    return factId ? this.rewardUsageFacts.get(factId) : undefined;
   }
 
   addRuleCompletion(programId: string, memberId: string, ruleKind: RuleKind): void {
